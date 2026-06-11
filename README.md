@@ -4,11 +4,11 @@ This demo shows how Envoy can:
 
 - read `x-timeout-ms` in a Lua filter, map it to `x-envoy-upstream-rq-timeout-ms`, and enforce a per-request upstream timeout
 - enforce a global QPS limit for all proxied requests; over-limit clients get `429 Too Many Requests`
-- proxy arbitrary HTTPS upstreams via the dynamic forward proxy cluster, with the target host encoded in the request path
+- proxy arbitrary HTTP(S) upstreams via the dynamic forward proxy cluster, with the target host set in the HTTP request-target (`--request-target` in curl)
 
 ## Files
 
-- `envoy.yaml.template` — Envoy listener, Lua filter (timeout + upstream path rewrite), local rate limit filter, dynamic forward proxy filter/cluster, routes
+- `envoy.yaml.template` — Envoy listener, Lua filter (timeout), local rate limit filter, dynamic forward proxy filter/cluster, routes
 - `docker-entrypoint-envoy.sh` — validates env and renders the Envoy config at startup
 - `.env` — `GLOBAL_QPS_LIMIT` and optional `GLOBAL_QPS_BURST`
 - `server.js` — custom Node.js delay server with `GET /delay/:delay_ms`
@@ -43,28 +43,29 @@ QPS limiting uses Envoy's native `envoy.filters.http.local_ratelimit` filter wit
 
 Over-limit requests are rejected before upstream proxying with `429 Too Many Requests` (and optional `x-ratelimit-*` headers).
 
-### Dynamic upstream routing
+### Dynamic upstream routing (forward proxy)
 
-Requests whose path starts with `/upstream/` are routed through Envoy's dynamic forward proxy. The Lua filter rewrites the request before the DFP filter runs:
+Envoy runs as an HTTP forward proxy for requests that use an absolute URI in the request-target. Set the downstream host by passing the full upstream URL via curl's `--request-target`:
 
-| Client request path | Rewritten `:authority` | Rewritten `:path` |
-|---------------------|------------------------|-------------------|
-| `/upstream/exchange.staging.adtonos.com:443/_data` | `exchange.staging.adtonos.com:443` | `/_data` |
-| `/upstream/example.com/api/v1` | `example.com:443` | `/api/v1` |
-
-Format:
-
-```
-/upstream/<host>[:<port>]/<path>
+```bash
+curl -v -H 'X-Timeout-Ms: 200' http://localhost:10000/ --request-target "http://example.com/path"
 ```
 
-- `<port>` defaults to `443` when omitted (HTTPS upstream).
-- Query strings are preserved (`/upstream/host/path?foo=bar` → `/path?foo=bar`).
-- No custom routing headers are required; the target is part of the URL.
+That sends a request line like:
 
-All other paths (for example `/delay/100`) go to the local delay server cluster.
+```
+GET http://example.com/path HTTP/1.1
+```
 
-The dynamic forward proxy cluster uses `envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig` with a shared DNS cache. Hosts are resolved on demand and cached. Upstream connections use TLS with the system CA bundle.
+`http_protocol_options.allow_absolute_url` is enabled on the listener. Envoy parses the absolute URI from the request-target and sets `:authority` to the upstream host. Requests whose `:authority` is `localhost:10000` (normal relative paths) go to the local delay server; all other authorities are routed to the dynamic forward proxy cluster.
+
+| Request-target | Upstream |
+|----------------|----------|
+| `http://example.com/path` | `example.com:80` over plain HTTP |
+| `https://exchange.staging.adtonos.com/_data` | `exchange.staging.adtonos.com:443` over TLS |
+| `/delay/100` (normal relative path) | local delay server (`:3000`) |
+
+The dynamic forward proxy cluster uses `envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig` with a shared DNS cache. Hosts are resolved on demand and cached. Port `443` uses TLS; other ports use plain HTTP.
 
 Example — local delay server (default):
 
@@ -72,16 +73,16 @@ Example — local delay server (default):
 curl -i http://localhost:10000/delay/100
 ```
 
-Example — external HTTPS upstream via path:
+Example — external HTTP upstream via request-target:
 
 ```bash
-curl -i http://localhost:10000/upstream/exchange.staging.adtonos.com:443/_data
+curl -i http://localhost:10000/ --request-target "http://example.com/path"
 ```
 
-Example — external host with default port 443:
+Example — external HTTPS upstream:
 
 ```bash
-curl -i http://localhost:10000/upstream/example.com/status
+curl -i http://localhost:10000/ --request-target "https://exchange.staging.adtonos.com/_data"
 ```
 
 ## Test
@@ -98,6 +99,12 @@ Expected timeout through Envoy:
 curl -i -H 'x-timeout-ms: 1234' http://localhost:10000/delay/3000
 ```
 
+Forward proxy with per-request timeout:
+
+```bash
+curl -i -H 'X-Timeout-Ms: 200' http://localhost:10000/ --request-target "http://example.com/path"
+```
+
 Direct call to upstream, no Envoy enforcement:
 
 ```bash
@@ -108,12 +115,6 @@ Invalid header rejected by Lua:
 
 ```bash
 curl -i -H 'x-timeout-ms: abc' http://localhost:10000/delay/100
-```
-
-Invalid upstream path rejected by Lua:
-
-```bash
-curl -i http://localhost:10000/upstream/example.com
 ```
 
 Quota exceeded (default limit is 10 QPS from `.env`):
@@ -142,15 +143,14 @@ The script prints a summary with accepted vs quota-rejected counts.
 - All requests through Envoy share one global QPS token bucket (`GLOBAL_QPS_LIMIT` / `GLOBAL_QPS_BURST` in `.env`).
 - When the bucket is empty, Envoy returns `429` without calling upstream.
 - Rate-limit stats are emitted under the `global_qps_limiter.http_local_rate_limit.*` namespace on the admin port.
-- `/upstream/<host>[:<port>]/<path>` requests are proxied to the named HTTPS host via the dynamic forward proxy cluster.
-- All other requests use the local delay server.
+- Absolute-URI request-targets (`http://...` / `https://...`) are proxied to the named host via the dynamic forward proxy cluster (upstream host taken from the request-target, not the `Host` header).
+- Relative paths sent to `localhost:10000` use the local delay server.
 
 ## Notes
 
 - Route timeout is set to `15s` as a fallback when `x-timeout-ms` is absent.
 - Retries are disabled so the timeout behaves like a hard outer deadline.
 - Cluster `connect_timeout` remains static at `2s` for the delay server; the dynamic forward proxy cluster uses `5s`.
-- QPS enforcement is handled by `envoy.filters.http.local_ratelimit`; Lua handles timeout validation and `/upstream/` path rewriting.
-- The dynamic forward proxy cluster terminates TLS to upstreams. Use `/delay/...` for plain HTTP to the local delay server.
+- QPS enforcement is handled by `envoy.filters.http.local_ratelimit`; Lua is only used for timeout validation.
 - For multi-instance deployments, each Envoy process enforces its own local limit. Use a global rate-limit service (`envoy.filters.http.ratelimit` + RLS) if you need a cluster-wide cap.
 - Dynamic forward proxy exposes the proxy to confused-deputy risks if clients can name arbitrary hosts. Restrict network access and add RBAC or an allowlist before using this pattern in production.
