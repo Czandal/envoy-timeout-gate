@@ -1,0 +1,96 @@
+static_resources:
+  listeners:
+  - name: listener_http
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          stream_idle_timeout: 0s
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: app
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: delayed_service
+                  timeout: 15s
+                  retry_policy:
+                    retry_on: ""
+                    num_retries: 0
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  local MIN_TIMEOUT_MS = 1
+                  local MAX_TIMEOUT_MS = 60000
+
+                  local function bad_request(handle, msg)
+                    handle:respond(
+                      { [":status"] = "400", ["content-type"] = "text/plain" },
+                      msg
+                    )
+                  end
+
+                  function envoy_on_request(handle)
+                    local h = handle:headers()
+                    local timeout_ms = h:get("x-timeout-ms")
+
+                    if timeout_ms == nil then
+                      return
+                    end
+
+                    if not string.match(timeout_ms, "^%d+$") then
+                      bad_request(handle, "x-timeout-ms must be an integer number of milliseconds\n")
+                      return
+                    end
+
+                    local n = tonumber(timeout_ms)
+                    if n == nil then
+                      bad_request(handle, "x-timeout-ms is invalid\n")
+                      return
+                    end
+
+                    if n < MIN_TIMEOUT_MS or n > MAX_TIMEOUT_MS then
+                      bad_request(handle, "x-timeout-ms out of allowed range (1..60000)\n")
+                      return
+                    end
+
+                    h:replace("x-envoy-upstream-rq-timeout-ms", tostring(n))
+                    h:remove("x-envoy-upstream-rq-per-try-timeout-ms")
+                  end
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: delayed_service
+    type: STRICT_DNS
+    connect_timeout: 2s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: delayed_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: delayed_service
+                port_value: 3000
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
