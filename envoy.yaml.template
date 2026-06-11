@@ -21,6 +21,25 @@ static_resources:
               routes:
               - match:
                   prefix: "/"
+                  headers:
+                  - name: exchange
+                    present_match: true
+                request_headers_to_remove:
+                - exchange
+                route:
+                  cluster: exchange_staging
+                  timeout: 15s
+                  host_rewrite_literal: __EXCHANGE_UPSTREAM_HOST__
+                  regex_rewrite:
+                    pattern:
+                      google_re2: {}
+                      regex: "^/.*$"
+                    substitution: "/_data"
+                  retry_policy:
+                    retry_on: ""
+                    num_retries: 0
+              - match:
+                  prefix: "/"
                 route:
                   cluster: delayed_service
                   timeout: 15s
@@ -70,6 +89,28 @@ static_resources:
                     h:replace("x-envoy-upstream-rq-timeout-ms", tostring(n))
                     h:remove("x-envoy-upstream-rq-per-try-timeout-ms")
                   end
+          - name: envoy.filters.http.local_ratelimit
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+              stat_prefix: global_qps_limiter
+              token_bucket:
+                max_tokens: __GLOBAL_QPS_BURST__
+                tokens_per_fill: __GLOBAL_QPS_LIMIT__
+                fill_interval: 1s
+              filter_enabled:
+                runtime_key: global_qps_limit_enabled
+                default_value:
+                  numerator: 100
+                  denominator: HUNDRED
+              filter_enforced:
+                runtime_key: global_qps_limit_enforced
+                default_value:
+                  numerator: 100
+                  denominator: HUNDRED
+              status:
+                code: 429
+              local_rate_limit_per_downstream_connection: false
+              enable_x_ratelimit_headers: DRAFT_VERSION_03
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -88,6 +129,24 @@ static_resources:
               socket_address:
                 address: delayed_service
                 port_value: 3000
+  - name: exchange_staging
+    type: STRICT_DNS
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: exchange_staging
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: __EXCHANGE_UPSTREAM_HOST__
+                port_value: __EXCHANGE_UPSTREAM_PORT__
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: __EXCHANGE_UPSTREAM_HOST__
 
 admin:
   address:
