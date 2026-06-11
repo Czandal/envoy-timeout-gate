@@ -36,6 +36,8 @@ const server = http.createServer(async (req, res) => {
   const envoyUpstreamTimeout = req.headers['x-envoy-upstream-rq-timeout-ms'] || null;
   const envoyExpectedTimeout = req.headers['x-envoy-expected-rq-timeout-ms'] || null;
 
+  console.log('Waiting', { delayMs });
+
   await new Promise(resolve => setTimeout(resolve, delayMs));
 
   return json(res, 200, {
