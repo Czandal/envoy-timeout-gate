@@ -34,6 +34,9 @@ static_resources:
                   retry_policy:
                     retry_on: ""
                     num_retries: 0
+                  internal_redirect_policy:
+                    max_internal_redirects: 3
+                    allow_cross_scheme_redirect: true
               - match:
                   prefix: "/"
                 route:
@@ -42,6 +45,9 @@ static_resources:
                   retry_policy:
                     retry_on: ""
                     num_retries: 0
+                  internal_redirect_policy:
+                    max_internal_redirects: 3
+                    allow_cross_scheme_redirect: true
           http_filters:
           - name: envoy.filters.http.lua
             typed_config:
