@@ -4,13 +4,13 @@ This demo shows how Envoy can:
 
 - read `x-timeout-ms` in a Lua filter, map it to `x-envoy-upstream-rq-timeout-ms`, and enforce a per-request upstream timeout
 - enforce a global QPS limit for all proxied requests; over-limit clients get `429 Too Many Requests`
-- route requests with an `exchange` header to `exchange.staging.adtonos.com/_data`; all others go to the local server
+- proxy arbitrary HTTPS upstreams via the dynamic forward proxy cluster, with the target host encoded in the request path
 
 ## Files
 
-- `envoy.yaml.template` — Envoy listener, Lua filter (timeout), local rate limit filter, route, cluster
+- `envoy.yaml.template` — Envoy listener, Lua filter (timeout + upstream path rewrite), local rate limit filter, dynamic forward proxy filter/cluster, routes
 - `docker-entrypoint-envoy.sh` — validates env and renders the Envoy config at startup
-- `.env` — `GLOBAL_QPS_LIMIT`, optional `GLOBAL_QPS_BURST`, and exchange upstream settings
+- `.env` — `GLOBAL_QPS_LIMIT` and optional `GLOBAL_QPS_BURST`
 - `server.js` — custom Node.js delay server with `GET /delay/:delay_ms`
 - `Dockerfile.server` — image for the delay server
 - `docker-compose.yml` — starts Envoy and the delay server
@@ -43,14 +43,28 @@ QPS limiting uses Envoy's native `envoy.filters.http.local_ratelimit` filter wit
 
 Over-limit requests are rejected before upstream proxying with `429 Too Many Requests` (and optional `x-ratelimit-*` headers).
 
-### Header-based routing
+### Dynamic upstream routing
 
-If the request includes an `exchange` header (any value), Envoy proxies it to `EXCHANGE_UPSTREAM_HOST/_data` over HTTPS. The header is stripped before forwarding. All other requests go to the local delay server.
+Requests whose path starts with `/upstream/` are routed through Envoy's dynamic forward proxy. The Lua filter rewrites the request before the DFP filter runs:
 
-| `exchange` header | Upstream |
-|-------------------|----------|
-| present | `exchange.staging.adtonos.com/_data` (configurable via `.env`) |
-| absent | local delay server (`:3000`) |
+| Client request path | Rewritten `:authority` | Rewritten `:path` |
+|---------------------|------------------------|-------------------|
+| `/upstream/exchange.staging.adtonos.com:443/_data` | `exchange.staging.adtonos.com:443` | `/_data` |
+| `/upstream/example.com/api/v1` | `example.com:443` | `/api/v1` |
+
+Format:
+
+```
+/upstream/<host>[:<port>]/<path>
+```
+
+- `<port>` defaults to `443` when omitted (HTTPS upstream).
+- Query strings are preserved (`/upstream/host/path?foo=bar` → `/path?foo=bar`).
+- No custom routing headers are required; the target is part of the URL.
+
+All other paths (for example `/delay/100`) go to the local delay server cluster.
+
+The dynamic forward proxy cluster uses `envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig` with a shared DNS cache. Hosts are resolved on demand and cached. Upstream connections use TLS with the system CA bundle.
 
 Example — local delay server (default):
 
@@ -58,17 +72,16 @@ Example — local delay server (default):
 curl -i http://localhost:10000/delay/100
 ```
 
-Example — exchange staging (`/_data` on upstream, regardless of client path):
+Example — external HTTPS upstream via path:
 
 ```bash
-curl -i -H 'exchange: 1' http://localhost:10000/anything
+curl -i http://localhost:10000/upstream/exchange.staging.adtonos.com:443/_data
 ```
 
-Configure the exchange host/port in `.env`:
+Example — external host with default port 443:
 
 ```bash
-EXCHANGE_UPSTREAM_HOST=exchange.staging.adtonos.com
-EXCHANGE_UPSTREAM_PORT=443
+curl -i http://localhost:10000/upstream/example.com/status
 ```
 
 ## Test
@@ -97,6 +110,12 @@ Invalid header rejected by Lua:
 curl -i -H 'x-timeout-ms: abc' http://localhost:10000/delay/100
 ```
 
+Invalid upstream path rejected by Lua:
+
+```bash
+curl -i http://localhost:10000/upstream/example.com
+```
+
 Quota exceeded (default limit is 10 QPS from `.env`):
 
 ```bash
@@ -123,12 +142,15 @@ The script prints a summary with accepted vs quota-rejected counts.
 - All requests through Envoy share one global QPS token bucket (`GLOBAL_QPS_LIMIT` / `GLOBAL_QPS_BURST` in `.env`).
 - When the bucket is empty, Envoy returns `429` without calling upstream.
 - Rate-limit stats are emitted under the `global_qps_limiter.http_local_rate_limit.*` namespace on the admin port.
-- Requests with an `exchange` header are rewritten to `/_data` on the configured HTTPS exchange host; all other requests use the local delay server.
+- `/upstream/<host>[:<port>]/<path>` requests are proxied to the named HTTPS host via the dynamic forward proxy cluster.
+- All other requests use the local delay server.
 
 ## Notes
 
 - Route timeout is set to `15s` as a fallback when `x-timeout-ms` is absent.
 - Retries are disabled so the timeout behaves like a hard outer deadline.
-- Cluster `connect_timeout` remains static at `2s`; this demo changes request timeout, not per-request TCP connect timeout.
-- QPS enforcement is handled by `envoy.filters.http.local_ratelimit`; Lua is only used for timeout validation.
+- Cluster `connect_timeout` remains static at `2s` for the delay server; the dynamic forward proxy cluster uses `5s`.
+- QPS enforcement is handled by `envoy.filters.http.local_ratelimit`; Lua handles timeout validation and `/upstream/` path rewriting.
+- The dynamic forward proxy cluster terminates TLS to upstreams. Use `/delay/...` for plain HTTP to the local delay server.
 - For multi-instance deployments, each Envoy process enforces its own local limit. Use a global rate-limit service (`envoy.filters.http.ratelimit` + RLS) if you need a cluster-wide cap.
+- Dynamic forward proxy exposes the proxy to confused-deputy risks if clients can name arbitrary hosts. Restrict network access and add RBAC or an allowlist before using this pattern in production.

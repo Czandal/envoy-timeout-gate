@@ -6,7 +6,7 @@ const upstreamOk = new Counter('upstream_ok');
 const unexpected = new Counter('unexpected_responses');
 
 // Demo: Envoy is configured for 10 QPS (see .env). This test sends 20 QPS.
-const TARGET_QPS = 20;
+const TARGET_QPS = 30;
 const DEMO_ENVOY_QPS = 10;
 const TEST_DURATION = '10s';
 
