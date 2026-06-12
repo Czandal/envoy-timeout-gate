@@ -37,10 +37,27 @@ static_resources:
                   internal_redirect_policy:
                     max_internal_redirects: 3
                     allow_cross_scheme_redirect: true
+              # Route HTTPS requests to the TLS-enabled forward proxy cluster
+              - match:
+                  prefix: "/"
+                  headers:
+                  - name: ":scheme"
+                    string_match:
+                      exact: "https"
+                route:
+                  cluster: dynamic_forward_proxy_tls
+                  timeout: 15s
+                  retry_policy:
+                    retry_on: ""
+                    num_retries: 0
+                  internal_redirect_policy:
+                    max_internal_redirects: 3
+                    allow_cross_scheme_redirect: true
+              # Route HTTP requests to the plaintext forward proxy cluster
               - match:
                   prefix: "/"
                 route:
-                  cluster: dynamic_forward_proxy
+                  cluster: dynamic_forward_proxy_plaintext
                   timeout: 15s
                   retry_policy:
                     retry_on: ""
@@ -56,38 +73,31 @@ static_resources:
                 inline_string: |
                   local MIN_TIMEOUT_MS = 1
                   local MAX_TIMEOUT_MS = 60000
-
                   local function bad_request(handle, msg)
                     handle:respond(
                       { [":status"] = "400", ["content-type"] = "text/plain" },
                       msg
                     )
                   end
-
                   function envoy_on_request(handle)
                     local h = handle:headers()
                     local timeout_ms = h:get("x-timeout-ms")
-
                     if timeout_ms == nil then
                       return
                     end
-
                     if not string.match(timeout_ms, "^%d+$") then
                       bad_request(handle, "x-timeout-ms must be an integer number of milliseconds\n")
                       return
                     end
-
                     local n = tonumber(timeout_ms)
                     if n == nil then
                       bad_request(handle, "x-timeout-ms is invalid\n")
                       return
                     end
-
                     if n < MIN_TIMEOUT_MS or n > MAX_TIMEOUT_MS then
                       bad_request(handle, "x-timeout_ms out of allowed range (1..60000)\n")
                       return
                     end
-
                     h:replace("x-envoy-upstream-rq-timeout-ms", tostring(n))
                     h:remove("x-envoy-upstream-rq-per-try-timeout-ms")
                   end
@@ -126,7 +136,6 @@ static_resources:
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-
   clusters:
   - name: delayed_service
     type: STRICT_DNS
@@ -151,7 +160,8 @@ static_resources:
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
 
-  - name: dynamic_forward_proxy
+  # Cluster for HTTPS upstream targets — always uses TLS
+  - name: dynamic_forward_proxy_tls
     lb_policy: CLUSTER_PROVIDED
     connect_timeout: 5s
     typed_extension_protocol_options:
@@ -174,16 +184,41 @@ static_resources:
             name: envoy.network.dns_resolver.cares
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
-        allow_insecure_cluster_options: true
     transport_socket:
       name: envoy.transport_sockets.tls
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: "%DYNAMIC_FORWARD_PROXY_HOST%"
         common_tls_context:
           validation_context:
             trusted_ca:
               filename: /etc/ssl/certs/ca-certificates.crt
+
+  # Cluster for plain HTTP upstream targets — never uses TLS
+  - name: dynamic_forward_proxy_plaintext
+    lb_policy: CLUSTER_PROVIDED
+    connect_timeout: 5s
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        use_downstream_protocol_config:
+          http_protocol_options: {}
+          http2_protocol_options: {}
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config:
+          name: dynamic_forward_proxy_cache
+          dns_lookup_family: V4_PREFERRED
+          typed_dns_resolver_config:
+            name: envoy.network.dns_resolver.cares
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+        allow_insecure_cluster_options: true
+    transport_socket:
+      name: envoy.transport_sockets.raw_buffer
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
 
 admin:
   address:
