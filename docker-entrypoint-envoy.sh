@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-GLOBAL_QPS_LIMIT="${GLOBAL_QPS_LIMIT:-10}"
+GLOBAL_QPS_LIMIT="${PROXY_QPS:-10}"
 GLOBAL_QPS_BURST="${GLOBAL_QPS_BURST:-$GLOBAL_QPS_LIMIT}"
 
 if ! echo "$GLOBAL_QPS_LIMIT" | grep -Eq '^[0-9]+$'; then

@@ -1,0 +1,14 @@
+FROM envoyproxy/envoy:v1.33-latest
+
+ENV PROXY_LISTEN_ADDR=0.0.0.0:4321
+ENV PROXY_MAX_CONCURRENCY=100
+
+COPY ./envoy.yaml.template /etc/envoy/envoy.yaml.template
+COPY ./docker-entrypoint-envoy.sh /docker-entrypoint-envoy.sh
+
+RUN chmod +x /docker-entrypoint-envoy.sh
+
+
+EXPOSE 4321 9901
+
+ENTRYPOINT ["/bin/sh", "/docker-entrypoint-envoy.sh"]
